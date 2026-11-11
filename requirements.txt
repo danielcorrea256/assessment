@@ -1,0 +1,8 @@
+streamlit>=1.40
+requests>=2.32
+pydantic>=2.9
+pandas>=2.2
+serpapi>=0.1.5
+google-genai>=3.2.0
+httpx2>=2.0
+pypdf>=5.1
