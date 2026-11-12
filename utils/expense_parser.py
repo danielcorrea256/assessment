@@ -10,13 +10,11 @@ from typing import Any, Literal
 import httpx2
 import pandas as pd
 import streamlit as st
-from google import genai
 from google.genai import errors
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from utils.app_secrets import get_secret
+from utils.gemini_client import gemini_configured, run_structured_interaction
 
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 ACCEPTED_TYPES = ["jpg", "jpeg", "png", "pdf"]
 ExpenseCategory = Literal["Airfare", "Lodging", "Meals", "Ground Transport", "Other"]
 CATEGORY_OPTIONS: list[ExpenseCategory] = [
@@ -81,18 +79,9 @@ _GEMINI_RECEIPT_JSON_SCHEMA: dict[str, Any] = {
 
 def extract_receipt(file_name: str, file_bytes: bytes, mime_type: str) -> ReceiptExtraction:
     """Send a receipt to Gemini and validate its structured JSON response."""
-    api_key = _gemini_api_key()
-    if not api_key:
-        raise RuntimeError(
-            "GOOGLE_API_KEY or GEMINI_API_KEY is not configured in Streamlit secrets."
-        )
-
-    model = get_secret("GEMINI_MODEL", DEFAULT_GEMINI_MODEL) or DEFAULT_GEMINI_MODEL
-    client = genai.Client(api_key=api_key)
     file_type = "document" if mime_type == "application/pdf" else "image"
-    interaction = client.interactions.create(
-        model=model,
-        input=[
+    output_text = run_structured_interaction(
+        contents=[
             {
                 "type": "text",
                 "text": f"{_EXTRACTION_INSTRUCTIONS}\nUploaded receipt filename: {file_name}",
@@ -103,55 +92,52 @@ def extract_receipt(file_name: str, file_bytes: bytes, mime_type: str) -> Receip
                 "mime_type": mime_type,
             },
         ],
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": _GEMINI_RECEIPT_JSON_SCHEMA,
-        },
-        stream=False,
-        store=False,
+        json_schema=_GEMINI_RECEIPT_JSON_SCHEMA,
     )
-    output_text = getattr(interaction, "output_text", None)
-    if not isinstance(output_text, str):
-        raise TypeError("Gemini did not return a standard text response.")
-    if not output_text:
-        raise ValueError("Gemini returned an empty response.")
     return ReceiptExtraction.model_validate_json(output_text)
 
 
 def render_expense_collector() -> None:
     """Upload a receipt, extract fields, and offer CSV / JSON downloads."""
-    uploaded = st.file_uploader(
-        "Receipt",
-        type=ACCEPTED_TYPES,
-        accept_multiple_files=False,
-        help="JPG, PNG, or PDF. Phone photos and emailed invoice PDFs both work.",
-    )
+    with st.container(border=True):
+        st.markdown("##### Upload receipt")
+        uploaded = st.file_uploader(
+            "Receipt",
+            type=ACCEPTED_TYPES,
+            accept_multiple_files=False,
+            label_visibility="collapsed",
+            help="JPG, PNG, or PDF. Phone photos and emailed invoice PDFs both work.",
+        )
 
-    if uploaded is not None:
-        mime_type = uploaded.type or _guess_mime(uploaded.name)
-        st.caption(f"{uploaded.name} · {uploaded.size / 1024:.1f} KB · {mime_type}")
-        if st.button("Extract expense", type="primary"):
-            try:
-                with st.spinner("Reading the receipt with Gemini…"):
-                    extraction = extract_receipt(uploaded.name, uploaded.getvalue(), mime_type)
-            except httpx2.RequestError as exc:
-                st.error(
-                    "Could not connect to Gemini. Check your internet/DNS connection, then try again."
-                )
-                st.caption(f"Connection details: {exc}")
-            except (RuntimeError, ValueError, ValidationError, errors.APIError) as exc:
-                st.error(f"Extraction failed: {exc}")
-            else:
-                st.session_state.pop("receipt_expense_editor", None)
-                st.session_state["receipt_extraction"] = extraction
+        mime_type = None
+        extract_clicked = False
+        if uploaded is not None:
+            mime_type = uploaded.type or _guess_mime(uploaded.name)
+            st.caption(f"📎 {uploaded.name} · {uploaded.size / 1024:.1f} KB · {mime_type}")
+            extract_clicked = st.button("Extract expense", type="primary")
+
+    if uploaded is not None and mime_type is not None and extract_clicked:
+        try:
+            with st.spinner("Reading the receipt with Gemini…"):
+                extraction = extract_receipt(uploaded.name, uploaded.getvalue(), mime_type)
+        except httpx2.RequestError as exc:
+            st.error(
+                "Could not connect to Gemini. Check your internet/DNS connection, then try again."
+            )
+            st.caption(f"Connection details: {exc}")
+        except (RuntimeError, ValueError, ValidationError, errors.APIError) as exc:
+            st.error(f"Extraction failed: {exc}")
+        else:
+            st.session_state.pop("receipt_expense_editor", None)
+            st.session_state["receipt_extraction"] = extraction
 
     extraction = st.session_state.get("receipt_extraction")
     if isinstance(extraction, ReceiptExtraction):
+        st.divider()
         _render_extraction(extraction)
         return
 
-    if not _vision_configured():
+    if not gemini_configured():
         _render_manual_fallback(
             enabled_message=(
                 "Add GOOGLE_API_KEY or GEMINI_API_KEY to Streamlit secrets to enable "
@@ -172,6 +158,12 @@ def receipts_to_frame(extractions: list[ReceiptExtraction]) -> pd.DataFrame:
 
 def _render_extraction(extraction: ReceiptExtraction) -> None:
     st.subheader("Review extracted expense")
+
+    col_vendor, col_total, col_category = st.columns(3)
+    col_vendor.metric("Vendor", extraction.vendor)
+    col_total.metric("Total amount", f"{extraction.total_amount:.2f}")
+    col_category.metric("Category", extraction.expense_category)
+
     st.caption("Click a cell to edit. Valid changes are included in both downloads.")
     frame = receipts_to_frame([extraction])
     edited_frame = st.data_editor(
@@ -240,18 +232,30 @@ def _render_extraction(extraction: ReceiptExtraction) -> None:
 
 def _render_manual_fallback(enabled_message: str) -> None:
     """Keep expense export usable before a Gemini key is available."""
-    if not _vision_configured():
+    if not gemini_configured():
         st.info(enabled_message)
 
-    with st.form("manual_receipt"):
-        st.markdown("**Manual entry**")
-        vendor = st.text_input("Vendor")
-        spent_on = st.text_input("Date", placeholder="YYYY-MM-DD")
-        total_amount = st.number_input("Total amount", min_value=0.0, value=0.0, step=0.01)
-        tax = st.number_input("Tax", min_value=0.0, value=0.0, step=0.01)
-        category = st.selectbox("Expense category", CATEGORY_OPTIONS)
-        project_code = st.text_input("Project code")
-        submitted = st.form_submit_button("Save manual expense")
+    with st.container(border=True), st.form("manual_receipt"):
+        st.markdown("##### Manual entry")
+        col_vendor, col_date = st.columns(2)
+        with col_vendor:
+            vendor = st.text_input("Vendor")
+        with col_date:
+            spent_on = st.text_input("Date", placeholder="YYYY-MM-DD")
+
+        col_total, col_tax = st.columns(2)
+        with col_total:
+            total_amount = st.number_input("Total amount", min_value=0.0, value=0.0, step=0.01)
+        with col_tax:
+            tax = st.number_input("Tax", min_value=0.0, value=0.0, step=0.01)
+
+        col_category, col_project = st.columns(2)
+        with col_category:
+            category = st.selectbox("Expense category", CATEGORY_OPTIONS)
+        with col_project:
+            project_code = st.text_input("Project code")
+
+        submitted = st.form_submit_button("Save manual expense", type="primary")
 
     if not submitted:
         return
@@ -270,19 +274,6 @@ def _render_manual_fallback(enabled_message: str) -> None:
     st.session_state.pop("receipt_expense_editor", None)
     st.session_state["receipt_extraction"] = extraction
     _render_extraction(extraction)
-
-
-def _gemini_api_key() -> str:
-    """Support both Google and Gemini key names in Streamlit secrets."""
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        value = get_secret(name)
-        if value and not value.startswith("your_"):
-            return value
-    return ""
-
-
-def _vision_configured() -> bool:
-    return bool(_gemini_api_key())
 
 
 def _guess_mime(file_name: str) -> str:

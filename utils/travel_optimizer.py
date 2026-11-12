@@ -22,11 +22,15 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import pandas as pd
 import requests
 import streamlit as st
+from google.genai import errors as genai_errors
+from pydantic import BaseModel, Field, ValidationError
 
 from utils.app_secrets import get_secret
+from utils.gemini_client import gemini_configured, run_structured_interaction
 
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
@@ -305,6 +309,86 @@ def build_comparison(
     return frame.sort_values(["Route", "Net effective cost"]).reset_index(drop=True)
 
 
+class TravelRecommendation(BaseModel):
+    """A Gemini-written, persuasive brief on the best itinerary in a comparison."""
+
+    recommended_route: str = Field(description="Route label of the recommended option")
+    recommended_tier: str = Field(description="Loyalty tier of the recommended option")
+    headline: str = Field(
+        min_length=1,
+        description="One punchy sentence selling the recommended itinerary",
+    )
+    summary: str = Field(
+        min_length=1,
+        description="2-4 sentence persuasive case for the recommendation",
+    )
+    key_reasons: list[str] = Field(
+        min_length=1,
+        description="Short bullet reasons, covering cost and non-cost factors",
+    )
+    tradeoffs: list[str] = Field(
+        default_factory=list,
+        description="Honest caveats or what the traveler gives up with this pick",
+    )
+
+
+_RECOMMENDATION_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "recommended_route": {"type": "string"},
+        "recommended_tier": {"type": "string"},
+        "headline": {"type": "string"},
+        "summary": {"type": "string"},
+        "key_reasons": {"type": "array", "items": {"type": "string"}},
+        "tradeoffs": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "recommended_route",
+        "recommended_tier",
+        "headline",
+        "summary",
+        "key_reasons",
+        "tradeoffs",
+    ],
+}
+
+_RECOMMENDATION_INSTRUCTIONS = """You are a corporate travel advisor. A traveler compared \
+itineraries using net effective cost (NEC = base fare + ancillary fees - value of miles \
+earned). You will receive the full comparison table as JSON rows, one row per \
+route/loyalty-tier combination, already sorted with the lowest NEC per route flagged \
+as "Best on route".
+
+Recommend exactly one route + tier combination as the overall best choice and write a \
+confident, persuasive case for it, as if selling the traveler on this decision. Do not \
+recommend by cost alone: weigh stops (fewer is more convenient and less tiring), airline, \
+how much of the ancillary fees are waived by the tier, and how much value the miles add \
+toward future trips, then explain the full picture. Be honest: if the cheapest NEC option \
+has a real downside (e.g. a connection, a less convenient tier to reach), say so in \
+tradeoffs. Ground every claim in the numbers provided; do not invent data.
+Return only JSON matching the supplied schema.
+"""
+
+
+def generate_travel_recommendation(
+    comparison: pd.DataFrame, currency: str
+) -> TravelRecommendation:
+    """Ask Gemini to pick and sell the best itinerary from a priced comparison."""
+    if comparison.empty:
+        raise ValueError("No comparison rows to summarize.")
+
+    records = comparison.to_dict(orient="records")
+    prompt = (
+        f"{_RECOMMENDATION_INSTRUCTIONS}\n"
+        f"Currency: {currency}\n"
+        f"Comparison rows (JSON):\n{json.dumps(records, default=str)}"
+    )
+    output_text = run_structured_interaction(
+        contents=[{"type": "text", "text": prompt}],
+        json_schema=_RECOMMENDATION_JSON_SCHEMA,
+    )
+    return TravelRecommendation.model_validate_json(output_text)
+
+
 def render_travel_optimizer(root: Path) -> None:
     """Sidebar-independent Challenge 1 workspace."""
     rules_path = root / "loyalty_rules.json"
@@ -343,40 +427,48 @@ def render_travel_optimizer(root: Path) -> None:
     route_labels = [route["label"] for route in ROUTES]
     default_labels = route_labels[:2]
 
-    col_routes, col_dates = st.columns([1.3, 1])
-    with col_routes:
-        selected_labels = st.multiselect(
-            "Routes",
-            route_labels,
-            default=default_labels,
-            help="Pre-defined city pairs between South America and the United States.",
+    with st.container(border=True):
+        st.markdown("##### Search itinerary")
+        col_routes, col_dates = st.columns([1.3, 1])
+        with col_routes:
+            selected_labels = st.multiselect(
+                "Routes",
+                route_labels,
+                default=default_labels,
+                help="Pre-defined city pairs between South America and the United States.",
+            )
+        with col_dates:
+            outbound = st.date_input("Outbound", value=date.today() + timedelta(days=30))
+            round_trip = st.checkbox("Round trip", value=False)
+            return_on = None
+            if round_trip:
+                return_on = st.date_input("Return", value=date.today() + timedelta(days=37))
+
+        tier_names = [tier.name for tier in program.tiers]
+        col_tier, col_bags, col_seat = st.columns(3)
+        with col_tier:
+            tier_choice = st.selectbox(
+                "Loyalty tier",
+                ["Compare all tiers", *tier_names],
+                help="Compare all tiers to rank the same fare by net effective cost.",
+            )
+        with col_bags:
+            checked_bags = st.number_input(
+                "Checked bags", min_value=0, max_value=4, value=1, step=1
+            )
+        with col_seat:
+            include_seat = st.checkbox("Include seat-selection fee", value=True)
+
+        selected_tiers = program.tiers if tier_choice == "Compare all tiers" else [
+            tier for tier in program.tiers if tier.name == tier_choice
+        ]
+        selected_routes = [route for route in ROUTES if route["label"] in selected_labels]
+
+        search_clicked = st.button(
+            "Search flights and compare NEC", type="primary", disabled=not selected_routes
         )
-    with col_dates:
-        outbound = st.date_input("Outbound", value=date.today() + timedelta(days=30))
-        round_trip = st.checkbox("Round trip", value=False)
-        return_on = None
-        if round_trip:
-            return_on = st.date_input("Return", value=date.today() + timedelta(days=37))
 
-    tier_names = [tier.name for tier in program.tiers]
-    col_tier, col_bags, col_seat = st.columns(3)
-    with col_tier:
-        tier_choice = st.selectbox(
-            "Loyalty tier",
-            ["Compare all tiers", *tier_names],
-            help="Compare all tiers to rank the same fare by net effective cost.",
-        )
-    with col_bags:
-        checked_bags = st.number_input("Checked bags", min_value=0, max_value=4, value=1, step=1)
-    with col_seat:
-        include_seat = st.checkbox("Include seat-selection fee", value=True)
-
-    selected_tiers = program.tiers if tier_choice == "Compare all tiers" else [
-        tier for tier in program.tiers if tier.name == tier_choice
-    ]
-    selected_routes = [route for route in ROUTES if route["label"] in selected_labels]
-
-    if st.button("Search flights and compare NEC", type="primary", disabled=not selected_routes):
+    if search_clicked:
         offers, errors = _collect_offers(
             selected_routes,
             outbound=outbound,
@@ -398,10 +490,13 @@ def render_travel_optimizer(root: Path) -> None:
         )
         st.session_state["nec_comparison"] = comparison
         st.session_state["nec_currency"] = program.currency
+        # A fresh search invalidates any recommendation generated for the old table.
+        st.session_state.pop("travel_recommendation", None)
 
     comparison = st.session_state.get("nec_comparison")
     if isinstance(comparison, pd.DataFrame) and not comparison.empty:
         currency = st.session_state.get("nec_currency", program.currency)
+        st.divider()
         st.subheader("Net effective cost comparison")
         st.caption("The highlighted row is the lowest net effective cost for each route.")
         st.dataframe(
@@ -419,10 +514,61 @@ def render_travel_optimizer(root: Path) -> None:
         best = comparison.loc[comparison["Best on route"]]
         if not best.empty:
             winner = best.sort_values("Net effective cost").iloc[0]
-            st.success(
-                f"Lowest NEC in this search: {winner['Route']} on {winner['Tier']} "
-                f"at {winner['Net effective cost']:.2f} {currency}."
+            col_route, col_tier_metric, col_nec = st.columns(3)
+            col_route.metric("Best route", str(winner["Route"]))
+            col_tier_metric.metric("Best tier", str(winner["Tier"]))
+            col_nec.metric(
+                "Lowest net effective cost",
+                f"{winner['Net effective cost']:.2f} {currency}",
             )
+
+        _render_ai_recommendation(comparison, currency)
+
+
+def _render_ai_recommendation(comparison: pd.DataFrame, currency: str) -> None:
+    """Show a Gemini-written pitch for the best itinerary, generated on demand."""
+    st.subheader("🤖 AI travel advisor")
+
+    if not gemini_configured():
+        st.info(
+            "Add GOOGLE_API_KEY or GEMINI_API_KEY to Streamlit secrets to have Gemini "
+            "write a plain-language recommendation for this comparison."
+        )
+        return
+
+    if st.button("Ask Gemini for a recommendation", key="travel_recommendation_button"):
+        try:
+            with st.spinner("Asking Gemini to weigh cost, convenience, and loyalty value…"):
+                recommendation = generate_travel_recommendation(comparison, currency)
+        except httpx2.RequestError as exc:
+            st.error("Could not connect to Gemini. Check your connection, then try again.")
+            st.caption(f"Connection details: {exc}")
+        except (RuntimeError, ValueError, ValidationError, genai_errors.APIError) as exc:
+            st.error(f"Could not generate a recommendation: {exc}")
+        else:
+            st.session_state["travel_recommendation"] = recommendation
+
+    recommendation = st.session_state.get("travel_recommendation")
+    if not isinstance(recommendation, TravelRecommendation):
+        return
+
+    with st.container(border=True):
+        st.markdown(f"#### {recommendation.headline}")
+        st.caption(
+            f"Recommended: {recommendation.recommended_route} · {recommendation.recommended_tier}"
+        )
+        st.markdown(recommendation.summary)
+
+        col_reasons, col_tradeoffs = st.columns(2)
+        with col_reasons:
+            st.markdown("**Why this wins**")
+            for reason in recommendation.key_reasons:
+                st.markdown(f"- {reason}")
+        with col_tradeoffs:
+            if recommendation.tradeoffs:
+                st.markdown("**Worth knowing**")
+                for tradeoff in recommendation.tradeoffs:
+                    st.markdown(f"- {tradeoff}")
 
 
 def _collect_offers(
@@ -553,11 +699,12 @@ def _price_amount(price: Any) -> float | None:
 
 
 def _style_comparison(frame: pd.DataFrame):
-    """Apply theme-independent row colors and highlight the winning NEC."""
+    """Highlight the winning NEC row without fighting the app's dark theme."""
     def _paint(row: pd.Series) -> list[str]:
-        style = "background-color: #f1f5f9; color: #1e293b"
         if bool(row.get("Best on route")):
-            style = "background-color: #d1fae5; color: #12372a; font-weight: 600"
+            style = "background-color: rgba(16, 185, 129, 0.22); color: #6ee7b7; font-weight: 600"
+        else:
+            style = "background-color: transparent"
         return [style] * len(row)
 
     return frame.style.apply(_paint, axis=1).format(

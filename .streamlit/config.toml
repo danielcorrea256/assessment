@@ -1,0 +1,12 @@
+# Pins a single cohesive dark theme so the app looks the same everywhere,
+# instead of relying only on custom CSS layered on top of Streamlit's default.
+[theme]
+base = "dark"
+primaryColor = "#14b8a6"
+backgroundColor = "#0b1120"
+secondaryBackgroundColor = "#111827"
+textColor = "#e2e8f0"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
